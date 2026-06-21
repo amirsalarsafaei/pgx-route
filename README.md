@@ -14,7 +14,7 @@
 - **Writable CTE detection** — `WITH … INSERT/UPDATE/DELETE … SELECT` is correctly classified as a write.
 - **Automatic fallback on read-only errors** — if the replica returns a PostgreSQL `read_only_sql_transaction` error (e.g. after a failover), the query is transparently retried on the primary.
 - **Custom retry hook** — supply a `WithRetryOnError` callback to implement your own fallback policy in addition to the built-in detection (e.g. retry on `pgx.ErrNoRows` or connection errors).
-- **Single-pool mode** — pass `nil` as the read pool and the primary is used for all queries (no-op routing).
+- **Optional classification cache** — enable `WithCache` to memoize the read/write classification per SQL string, so the PostgreSQL parser runs at most once per distinct query instead of on every execution.
 
 ## Installation
 
@@ -54,7 +54,7 @@ _, err = pool.Exec(ctx, "INSERT INTO events (type) VALUES ($1)", "signup")
 func New(main, read *pgxpool.Pool, opts ...Option) *Pool
 ```
 
-Creates a new routing pool. If `read` is `nil` the primary pool is used for all queries.
+Creates a new routing pool. Both pools are required and must be distinct — the router is built for primary/replica setups and has no single-pool mode. Passing `nil` for either pool, or the same pool for both, panics.
 
 ### `Pool` methods
 
@@ -65,14 +65,14 @@ Creates a new routing pool. If `read` is `nil` the primary pool is used for all 
 | `Exec(ctx, sql, args...)` | Routes to read or primary based on the SQL statement. |
 | `Query(ctx, sql, args...)` | Routes to read or primary. Retries on primary if a read-only error is encountered during row iteration. |
 | `QueryRow(ctx, sql, args...)` | Routes to read or primary. Retries on primary when `Scan` returns a read-only error. |
-| `Close()` | Closes both pools (or just the primary if both are the same). |
-| `Reset()` | Resets both pools (or just the primary if both are the same). |
+| `Close()` | Closes both pools. |
+| `Reset()` | Resets both pools. |
 
 ### Accessors
 
 ```go
 pool.MainPool() *pgxpool.Pool  // returns the primary pool
-pool.ReadPool()  *pgxpool.Pool  // returns the replica pool (or primary if no replica was provided)
+pool.ReadPool()  *pgxpool.Pool  // returns the replica pool
 ```
 
 ### Options
@@ -98,6 +98,33 @@ pool := pgxrouter.New(primary, replica,
     }),
 )
 ```
+
+#### `WithCache`
+
+```go
+func WithCache(c Cache) Option
+```
+
+By default, every query is parsed by [pg_query_go](https://github.com/pganalyze/pg_query_go) to classify it as a read or a write. `WithCache` memoizes that classification keyed by the SQL text, so the parser runs at most once per distinct query string:
+
+```go
+pool := pgxrouter.New(primary, replica,
+    pgxrouter.WithCache(pgxrouter.NewMapCache()),
+)
+```
+
+`NewMapCache` returns a built-in, concurrency-safe, **unbounded** cache backed by a `sync.Map`. It is a good fit for applications that issue a bounded set of distinct query strings — for example parameterized queries using `$1`, `$2` placeholders. For workloads that interpolate literal values into the SQL text (where the number of distinct strings is unbounded), supply your own implementation of the `Cache` interface — e.g. a bounded LRU:
+
+```go
+type Cache interface {
+    Get(sql string) (mode classify.QueryMode, ok bool)
+    Set(sql string, mode classify.QueryMode)
+}
+```
+
+Comment overrides (`-- rw: write`) are part of the SQL text, so they are honored by the cache as well. Caching is disabled when no `WithCache` option is supplied.
+
+> If you use [sqlc](https://github.com/sqlc-dev/sqlc), consider [**sqlc-pgx-route**](https://github.com/amirsalarsafaei/sqlc-pgx-route) (see below) instead — it classifies queries at code-generation time and avoids runtime parsing entirely, with no cache required.
 
 ## Routing Rules
 

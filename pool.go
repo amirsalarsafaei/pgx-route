@@ -18,11 +18,25 @@ type Option func(*poolConfig)
 
 type poolConfig struct {
 	retryOnError func(error) bool
+	cache        Cache
 }
 
 func WithRetryOnError(fn func(error) bool) Option {
 	return func(c *poolConfig) {
 		c.retryOnError = fn
+	}
+}
+
+// WithCache enables caching of query-mode classification results. The cache is
+// consulted before parsing each SQL statement and populated with the result,
+// so the PostgreSQL parser runs at most once per distinct query.
+//
+// Pass NewMapCache() for a simple built-in cache, or supply your own Cache
+// implementation (e.g. a bounded LRU) for custom eviction behaviour. Caching is
+// disabled by default.
+func WithCache(c Cache) Option {
+	return func(cfg *poolConfig) {
+		cfg.cache = c
 	}
 }
 
@@ -32,9 +46,15 @@ type Pool struct {
 	cfg  poolConfig
 }
 
+// New creates a routing pool over a main (read-write) and a separate read
+// (read-only) pool. Both pools are required and must be distinct — the router
+// is built for primary/replica setups and has no single-pool mode.
 func New(main, read *pgxpool.Pool, opts ...Option) *Pool {
-	if read == nil {
-		read = main
+	switch {
+	case main == nil || read == nil:
+		panic("pgxrouter: New requires both a main and a read pool")
+	case main == read:
+		panic("pgxrouter: main and read must be distinct pools")
 	}
 	var cfg poolConfig
 	for _, o := range opts {
@@ -50,7 +70,7 @@ func (p *Pool) MainPool() *pgxpool.Pool { return p.Pool }
 func (p *Pool) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	pool := p.route(sql)
 	tag, err := pool.Exec(ctx, sql, args...)
-	if pool == p.read && p.read != p.Pool && p.shouldRetryOnMain(err) {
+	if pool == p.read && p.shouldRetryOnMain(err) {
 		return p.Pool.Exec(ctx, sql, args...)
 	}
 	return tag, err
@@ -59,7 +79,7 @@ func (p *Pool) Exec(ctx context.Context, sql string, args ...any) (pgconn.Comman
 func (p *Pool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
 	pool := p.route(sql)
 	rows, err := pool.Query(ctx, sql, args...)
-	if pool == p.read && p.read != p.Pool {
+	if pool == p.read {
 		if p.shouldRetryOnMain(err) {
 			return p.Pool.Query(ctx, sql, args...)
 		}
@@ -76,25 +96,37 @@ func (p *Pool) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 }
 
 func (p *Pool) Close() {
-	if p.read != p.Pool {
-		p.read.Close()
-	}
+	p.read.Close()
 	p.Pool.Close()
 }
 
 func (p *Pool) Reset() {
-	if p.read != p.Pool {
-		p.read.Reset()
-	}
+	p.read.Reset()
 	p.Pool.Reset()
 }
 
 func (p *Pool) route(sql string) *pgxpool.Pool {
-	comments := extractLeadingComments(sql)
-	if classify.Classify(sql, comments) == classify.ModeRead {
+	if p.classify(sql) == classify.ModeRead {
 		return p.read
 	}
 	return p.Pool
+}
+
+// classify determines the query mode for sql, consulting and populating the
+// optional cache when one is configured.
+func (p *Pool) classify(sql string) classify.QueryMode {
+	if p.cfg.cache != nil {
+		if mode, ok := p.cfg.cache.Get(sql); ok {
+			return mode
+		}
+	}
+
+	mode := classify.Classify(sql, extractLeadingComments(sql))
+
+	if p.cfg.cache != nil {
+		p.cfg.cache.Set(sql, mode)
+	}
+	return mode
 }
 
 // shouldRetryOnMain returns true when an error from the read replica
@@ -127,7 +159,7 @@ type retryRow struct {
 
 func (r *retryRow) Scan(dest ...any) error {
 	err := r.row.Scan(dest...)
-	if r.routed == r.pool.read && r.pool.read != r.pool.Pool && r.pool.shouldRetryOnMain(err) {
+	if r.routed == r.pool.read && r.pool.shouldRetryOnMain(err) {
 		return r.pool.Pool.QueryRow(r.ctx, r.sql, r.args...).Scan(dest...)
 	}
 	return err
@@ -169,7 +201,7 @@ func (r *retryRows) Next() bool {
 	if r.rows.Next() {
 		return true
 	}
-	if r.retried || r.routed != r.pool.read || r.pool.read == r.pool.Pool {
+	if r.retried || r.routed != r.pool.read {
 		return false
 	}
 	if !r.pool.shouldRetryOnMain(r.rows.Err()) {

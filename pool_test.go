@@ -337,62 +337,27 @@ func (s *ReadOnlyRetrySuite) TestCustomRetryHandler() {
 	s.Assert().NotNil(capturedErr, "custom retry handler should have been called")
 }
 
-// SinglePoolSuite tests behavior when read pool is nil.
-type SinglePoolSuite struct {
-	suite.Suite
-	ctx    context.Context
-	cancel context.CancelFunc
-	db     *PostgresContainer
-	pool   *Pool
-}
-
-func (s *SinglePoolSuite) SetupSuite() {
-	s.ctx, s.cancel = context.WithTimeout(context.Background(), 5*time.Minute)
-
-	var err error
-	s.db, err = startContainer(s.ctx, "single")
-	s.Require().NoError(err)
-}
-
-func (s *SinglePoolSuite) TearDownSuite() {
-	s.cancel()
-	cleanupContainer(s.db)
-}
-
-func (s *SinglePoolSuite) SetupTest() {
-	ctx, cancel := context.WithTimeout(s.ctx, testTimeout)
-	defer cancel()
-
-	setupMarkerTable(s.T(), ctx, s.db.Pool, "single")
-	s.pool = New(s.db.Pool, nil)
-}
-
-func TestSinglePoolSuite(t *testing.T) {
-	suite.Run(t, new(SinglePoolSuite))
-}
-
-func (s *SinglePoolSuite) TestReadPoolFallsBackToMain() {
-	s.Assert().Equal(s.db.Pool, s.pool.ReadPool())
-	s.Assert().Equal(s.db.Pool, s.pool.MainPool())
-}
-
-func (s *SinglePoolSuite) TestQueryUsesMainPool() {
-	ctx, cancel := context.WithTimeout(s.ctx, testTimeout)
-	defer cancel()
-
-	var label string
-	err := s.pool.QueryRow(ctx, `SELECT label FROM marker`).Scan(&label)
-	s.Require().NoError(err)
-	s.Assert().Equal("single", label)
-}
-
-func (s *SinglePoolSuite) TestNoRetryWhenSamePool() {
-	ctx, cancel := context.WithTimeout(s.ctx, testTimeout)
-	defer cancel()
-
-	var dummy int
-	err := s.pool.QueryRow(ctx, `SELECT 1 FROM nonexistent_table`).Scan(&dummy)
-	s.Assert().Error(err, "expected error for missing table, should not retry")
+func TestNewRequiresTwoDistinctPools(t *testing.T) {
+	p := &pgxpool.Pool{}
+	cases := []struct {
+		name       string
+		main, read *pgxpool.Pool
+	}{
+		{"nil read", p, nil},
+		{"nil main", nil, p},
+		{"both nil", nil, nil},
+		{"same pool", p, p},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("expected New to panic")
+				}
+			}()
+			New(tc.main, tc.read)
+		})
+	}
 }
 
 func startContainer(ctx context.Context, dbName string) (*PostgresContainer, error) {
